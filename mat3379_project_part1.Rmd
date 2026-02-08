@@ -1,0 +1,977 @@
+---
+title: "Time Series Analysis of GOOGL and NVDA"
+subtitle: "MAT 3379 -- Time Series Project, Part 1"
+author:
+  - Kaan UN
+  - Thomas Tang
+  - Phoebe Gaudreault
+date: "February 10, 2026"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+    
+ #bibliography: references.bib   # not using bib on my site
+biblio-style: apalike
+link-citations: true
+header-includes:
+  - \usepackage{amsmath,amssymb,amsthm}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \usepackage{hyperref}
+  - \usepackage{graphicx}
+  - \usepackage{caption}
+  - \usepackage{subcaption}
+  - \usepackage{geometry}
+  - \geometry{margin=1in}
+  - \newcommand{\E}{\mathbb{E}}
+  - \newcommand{\Var}{\mathrm{Var}}
+  - \newcommand{\Cov}{\mathrm{Cov}}
+  - \newcommand{\nab}{\nabla}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.pos = "H",
+  out.width = "95%"
+)
+
+library(reticulate)
+use_python("C:/Users/cheng/AppData/Local/Programs/Python/Python310/python.exe", required = TRUE)
+py_config()
+
+```
+
+```{python py-setup, include=FALSE}
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from scipy import stats
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import warnings, os
+
+warnings.filterwarnings("ignore")
+np.random.seed(3379)
+
+plt.rcParams.update({
+    "figure.figsize": (13, 5),
+    "axes.grid": True,
+    "grid.alpha": 0.3,
+    "font.size": 11,
+})
+```
+
+\newpage
+
+# Introduction
+
+This report presents an empirical time series analysis of two financial instruments traded on U.S. equity markets: Alphabet Inc. (ticker: GOOGL) and NVIDIA Corporation (ticker: NVDA). Both series consist of daily closing prices recorded over the period from January 2, 2024 to January 31, 2026, totalling 522 trading day observations per series. The analysis follows the classical decomposition framework for time series as described in @brockwell2016, proceeding through data exploration, trend and seasonality removal via differencing, smoothing via linear and exponential filters, and stationarity assessment using the autocorrelation and partial autocorrelation functions.
+
+The structure of the report is as follows. Section 2 describes the data, including source, preprocessing, and graphical exploration. Section 3 addresses differencing to remove trend and seasonal components. Section 4 applies linear and exponential smoothing filters and compares their performance. Section 5 constructs stationary residual series and evaluates stationarity through hypothesis tests and correlation analysis. A complete code appendix is provided in Section 7.
+
+\newpage
+
+# Data Description
+
+## Data Selection and Characteristics
+
+The two time series selected for this analysis are the daily closing prices (in USD) of GOOGL (Alphabet Inc., Class A shares) and NVDA (NVIDIA Corporation). Both series are recorded at the same frequency (daily, on trading days only, approximately 252 per year) and span the same time period (January 2, 2024 to January 31, 2026). Neither series has been seasonally adjusted or differenced prior to collection; these are raw closing prices.
+
+The data were obtained from the S\&P 500 Daily Update Dataset hosted on Kaggle, published by user *yash16jr*. The dataset was accessed on February 7, 2026. The CSV file contains daily prices (open, high, low, close, adjusted close, volume) for all constituents of the S\&P 500 index.
+
+Table 1 summarizes the key attributes of the dataset.
+
+\begin{table}[H]
+\centering
+\caption{Dataset attributes.}
+\begin{tabular}{ll}
+\toprule
+Attribute & Detail \\
+\midrule
+Series & GOOGL (Alphabet Inc.) and NVDA (NVIDIA Corp.) \\
+Source & S\&P 500 Daily Update Dataset, Kaggle (user \textit{yash16jr}) \\
+Access date & February 7, 2026 \\
+Frequency & Daily (trading days, $\approx 252$ per year) \\
+Date range & January 2, 2024 to January 31, 2026 \\
+Units & USD (closing price) \\
+Observations & $N = 522$ per series \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+**Data preprocessing.** The raw CSV uses a multi row header format with separate rows for price type and ticker symbol. After parsing, we extracted the "Close" column for GOOGL and NVDA and restricted the date range to the target window. Forward fill followed by backward fill was applied to handle the rare case of a missing trading day in one series but not the other. No observations were dropped after this step, resulting in $N = 522$ aligned observations per series.
+
+**Interest in the selected series.** GOOGL and NVDA are among the largest constituents of the S\&P 500 and represent two distinct facets of the technology sector: cloud computing and digital advertising (Alphabet) versus semiconductors and AI hardware (NVIDIA). The 2024 to 2026 window captures a period of significant AI driven growth expectations, making these series suitable for studying trend dynamics, possible periodic patterns tied to earnings cycles, and volatility clustering.
+
+```{python load-data, include=FALSE}
+import kagglehub
+
+dataset_path = kagglehub.dataset_download("yash16jr/s-and-p500-daily-update-dataset")
+csv_path = str(next(Path(dataset_path).rglob("*.csv")))
+
+raw = pd.read_csv(csv_path, header=None, low_memory=False)
+price_types = raw.iloc[0, 1:].values
+tickers     = raw.iloc[1, 1:].values
+data        = raw.iloc[3:, 1:].values
+dates       = raw.iloc[3:, 0].values
+
+cols = pd.MultiIndex.from_arrays([price_types, tickers], names=["Price", "Ticker"])
+df_all = pd.DataFrame(data, index=pd.to_datetime(dates, errors="coerce"),
+                       columns=cols).apply(pd.to_numeric, errors="coerce").sort_index()
+df_all.index.name = "Date"
+
+close = df_all["Close"].loc[:, ~df_all["Close"].columns.duplicated()]
+TICKERS = ["GOOGL", "NVDA"]
+START, END = "2024-01-01", "2026-01-31"
+
+prices = close[TICKERS].loc[START:END].copy()
+prices = prices.ffill().bfill().dropna()
+N = len(prices)
+```
+
+Table 2 reports the descriptive statistics for both series.
+
+```{python desc-stats, include=FALSE}
+desc = prices.describe().T
+desc["IQR"] = desc["75%"] - desc["25%"]
+desc["range"] = desc["max"] - desc["min"]
+```
+
+\begin{table}[H]
+\centering
+\caption{Descriptive statistics of daily close prices (USD), January 2024 to January 2026.}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Ticker & Mean & Std & Min & Q1 & Median & Q3 & Max \\
+\midrule
+GOOGL & 169.07 & 20.46 & 132.32 & 155.48 & 167.09 & 179.85 & 204.93 \\
+NVDA & 104.21 & 33.74 & 47.54 & 78.77 & 117.93 & 131.97 & 149.43 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+NVDA exhibits a much larger standard deviation (33.74 vs. 20.46) and a wider range than GOOGL, reflecting the more volatile price trajectory of the semiconductor stock over this window. The interquartile ranges also confirm this difference.
+
+## Graphical Exploration
+
+```{python fig-raw-prices, fig.cap="Daily close prices for GOOGL and NVDA (January 2024 to January 2026).", results='hide'}
+fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
+for i, ticker in enumerate(TICKERS):
+    axes[i].plot(prices.index, prices[ticker], linewidth=1.2, color=f"C{i}")
+    axes[i].set_ylabel("Close Price (USD)")
+    axes[i].set_title(f"{ticker}")
+axes[-1].set_xlabel("Date")
+fig.tight_layout()
+plt.savefig("fig_raw_prices.pdf", bbox_inches="tight")
+plt.show()
+```
+
+```{python fig-normalized, fig.cap="Normalized performance of GOOGL and NVDA (base = 100 at start date).", results='hide'}
+norm = prices / prices.iloc[0] * 100
+fig, ax = plt.subplots(figsize=(13, 5))
+for ticker in TICKERS:
+    ax.plot(norm.index, norm[ticker], linewidth=1.3, label=ticker)
+ax.axhline(100, color="grey", ls="--", lw=0.8)
+ax.set_title("Normalized Performance (Base = 100 at Start)")
+ax.set_ylabel("Normalized Price")
+ax.set_xlabel("Date")
+ax.legend()
+plt.tight_layout()
+plt.savefig("fig_normalized.pdf", bbox_inches="tight")
+plt.show()
+```
+
+Both series display a clear upward trend over the two year window. NVDA shows a steeper and more volatile ascent driven by AI related demand, while GOOGL follows a steadier upward trajectory. The normalized comparison (Figure 2) shows that by January 2026, NVDA had approximately tripled in value from its starting level, whereas GOOGL had grown by roughly 50\%.
+
+**Hypothesis on trend and seasonality.**
+
+1. *Trend.* Both series exhibit a clear upward trend over the observation window. We hypothesize that first order differencing ($\nab X_t = X_t - X_{t-1}$) is sufficient to remove this trend component.
+
+2. *Seasonality.* Daily stock prices are not expected to display deterministic seasonality of the classical kind (periodic cycles with a fixed period $d$). However, two candidate periodicities could plausibly arise: a weekly cycle ($d = 5$ trading days) from day of week effects and a quarterly cycle ($d \approx 63$ trading days) from earnings announcements. We will test both via seasonal differencing. Our working hypothesis is that no strong deterministic seasonal component is present in either series.
+
+\newpage
+
+# Differencing
+
+## Removing the Trend
+
+The backward difference operator is defined as $\nab X_t = X_t - X_{t-1}$ and, more generally, $\nab^k X_t = \nab(\nab^{k-1} X_t)$. A fundamental result from @brockwell2016 [Theorem 1.4.1] states that if the trend component $m_t$ is a polynomial of degree $k$, then $\nab^{k+1} m_t = 0$. Formally:
+
+\begin{equation}
+\text{If } m_t = \sum_{j=0}^{k} a_j t^j, \quad \text{then} \quad \nab^{k+1} m_t = 0 \quad \text{for all } t.
+\end{equation}
+
+The plots in Section 2.2 suggest an approximately linear trend ($k = 1$), so first order differencing ($\nab X_t$) should annihilate the trend. We also compute $\nab^2 X_t$ to verify that second order differencing is not necessary.
+
+For a linear trend $m_t = a_0 + a_1 t$, we have:
+\begin{align}
+\nab m_t &= m_t - m_{t-1} = (a_0 + a_1 t) - (a_0 + a_1(t-1)) = a_1, \\
+\nab^2 m_t &= \nab(a_1) = 0.
+\end{align}
+Since $\nab m_t = a_1$ (a constant), first order differencing removes the linear trend entirely, and the differenced series $Y_t = \nab X_t$ retains only the stochastic component plus a constant shift.
+
+```{python diff-compute, include=FALSE}
+diff1 = prices.diff(1).dropna()
+diff2 = prices.diff(1).diff(1).dropna()
+```
+
+```{python fig-diff1-diff2, fig.cap="First order differences (left) and second order differences (right) for GOOGL and NVDA.", results='hide'}
+fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex="col")
+for i, ticker in enumerate(TICKERS):
+    axes[i, 0].plot(diff1.index, diff1[ticker], linewidth=0.7, color=f"C{i}")
+    axes[i, 0].axhline(0, color="k", lw=0.5)
+    axes[i, 0].set_title(f"{ticker} -- $\\nabla X_t$ (first difference)")
+    axes[i, 0].set_ylabel("USD")
+    axes[i, 1].plot(diff2.index, diff2[ticker], linewidth=0.7, color=f"C{i}")
+    axes[i, 1].axhline(0, color="k", lw=0.5)
+    axes[i, 1].set_title(f"{ticker} -- $\\nabla^2 X_t$ (second difference)")
+    axes[i, 1].set_ylabel("USD")
+for ax in axes[-1, :]:
+    ax.set_xlabel("Date")
+fig.tight_layout()
+plt.savefig("fig_diff_orders.pdf", bbox_inches="tight")
+plt.show()
+```
+
+After first order differencing, both series fluctuate around zero with no visible trend. The sample means of $\nab X_t$ are $\bar{Y}_{\text{GOOGL}} = 0.386$ and $\bar{Y}_{\text{NVDA}} = 0.274$, which are small relative to their respective standard deviations ($\hat{\sigma}_{\text{GOOGL}} = 3.62$, $\hat{\sigma}_{\text{NVDA}} = 3.88$). This confirms that a linear trend has been effectively removed.
+
+Second order differencing ($\nab^2 X_t$, right column of Figure 3) does not reveal additional structure; it merely amplifies noise. Therefore, first order differencing ($\nab^1$) is sufficient. By the result above, $\nab$ annihilates any polynomial of degree at most 1, and since the residuals show no remaining systematic drift, we conclude the trend is well approximated as linear.
+
+## Removing Seasonal Effects
+
+The seasonal differencing operator at period $d$ is defined as:
+\begin{equation}
+\nab_d X_t = X_t - X_{t-d}.
+\end{equation}
+If the seasonal component $s_t$ has period $d$ (i.e., $s_t = s_{t-d}$ for all $t$), then $\nab_d s_t = s_t - s_{t-d} = 0$, so the seasonal differencing operator removes the periodic component entirely.
+
+Daily stock prices do not exhibit classical seasonality in the same way as, for example, monthly temperature data. However, to rigorously verify this, we apply $\nab_d$ with two candidate periods:
+
+- $d = 5$ (weekly cycle, corresponding to 5 trading days per week),
+- $d = 63$ (quarterly cycle, corresponding to approximately 63 trading days per fiscal quarter).
+
+If no strong seasonal component exists, the differenced series should look similar to $\nab^1$ alone.
+
+```{python seasonal-diff, include=FALSE}
+diff_d5  = prices.diff(5).dropna()
+diff_d63 = prices.diff(63).dropna()
+```
+
+```{python fig-seasonal-diff, fig.cap="Seasonal differences for GOOGL and NVDA: weekly ($d = 5$, left) and quarterly ($d = 63$, right).", results='hide'}
+fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex="col")
+for i, ticker in enumerate(TICKERS):
+    axes[i, 0].plot(diff_d5.index, diff_d5[ticker], lw=0.7, color=f"C{i}")
+    axes[i, 0].axhline(0, color="k", lw=0.5)
+    axes[i, 0].set_title(f"{ticker} -- $\\nabla_5 X_t$ ($d = 5$, weekly)")
+    axes[i, 0].set_ylabel("USD")
+    axes[i, 1].plot(diff_d63.index, diff_d63[ticker], lw=0.7, color=f"C{i}")
+    axes[i, 1].axhline(0, color="k", lw=0.5)
+    axes[i, 1].set_title(f"{ticker} -- $\\nabla_{{63}} X_t$ ($d = 63$, quarterly)")
+    axes[i, 1].set_ylabel("USD")
+for ax in axes[-1, :]:
+    ax.set_xlabel("Date")
+fig.tight_layout()
+plt.savefig("fig_seasonal_diff.pdf", bbox_inches="tight")
+plt.show()
+```
+
+The lag 5 difference $\nab_5 X_t$ (left column, Figure 4) still shows a clear upward drift for both stocks, and the fluctuations grow in amplitude over time (especially visible for GOOGL in late 2025). The lag 5 difference only removes a weekly periodic component, which appears negligible here, while the trend passes through largely unchanged. This confirms that no meaningful weekly seasonal cycle is present.
+
+The lag 63 difference $\nab_{63} X_t$ (right column) subtracts the value 63 trading days earlier, so it removes more of the trend mechanically. However, a pronounced nonzero drift remains in both series. If a true quarterly seasonal component existed, $\nab_{63}$ would eliminate it and the residuals would fluctuate symmetrically around zero, which they do not.
+
+We conclude that no strong deterministic seasonal component with a fixed period is present in either series. The dominant nonstationary feature is a trend, not a seasonal cycle. The appropriate differencing strategy is therefore first order ($\nab^1$) to remove the trend.
+
+## Analysis of Differenced Series
+
+We apply both differencing procedures: first $\nab_d$ to remove any seasonal component, then $\nab$ to remove the trend. Since we found no meaningful seasonality, we focus on the series $\nab^1 X_t$ and examine whether it appears weakly stationary.
+
+```{python fig-diff1-analysis, fig.cap="First differenced series (left) and histograms with overlaid normal density (right).", results='hide'}
+diff_combined = prices.diff(5).diff(1).dropna()
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+for i, ticker in enumerate(TICKERS):
+    axes[i, 0].plot(diff1.index, diff1[ticker], lw=0.7, color=f"C{i}")
+    axes[i, 0].axhline(0, color="k", lw=0.5)
+    axes[i, 0].set_title(f"{ticker} -- $\\nabla X_t$")
+    axes[i, 0].set_ylabel("USD")
+    axes[i, 1].hist(diff1[ticker], bins=50, density=True, alpha=0.7, color=f"C{i}")
+    mu, sigma = diff1[ticker].mean(), diff1[ticker].std()
+    x_grid = np.linspace(diff1[ticker].min(), diff1[ticker].max(), 200)
+    axes[i, 1].plot(x_grid, stats.norm.pdf(x_grid, mu, sigma), "k-", lw=1.2,
+                    label=f"N({mu:.2f}, {sigma:.2f}$^2$)")
+    axes[i, 1].set_title(f"{ticker} -- Histogram of $\\nabla X_t$")
+    axes[i, 1].legend(fontsize=9)
+for ax in axes[-1, :]:
+    ax.set_xlabel("Date" if ax == axes[-1, 0] else "Value (USD)")
+fig.tight_layout()
+plt.savefig("fig_diff1_analysis.pdf", bbox_inches="tight")
+plt.show()
+```
+
+```{python diff1-stats, include=FALSE}
+diff1_stats = {}
+for ticker in TICKERS:
+    d = diff1[ticker]
+    diff1_stats[ticker] = {
+        "mean": d.mean(),
+        "std": d.std(),
+        "skew": d.skew(),
+        "kurt": d.kurtosis()
+    }
+```
+
+Table 3 reports the summary statistics of the first differenced series.
+
+\begin{table}[H]
+\centering
+\caption{Summary statistics of the first differenced series $\nab X_t$.}
+\begin{tabular}{lrrrr}
+\toprule
+Ticker & Mean & Std & Skewness & Excess Kurtosis \\
+\midrule
+GOOGL & 0.386 & 3.62 & 0.46 & 4.29 \\
+NVDA & 0.274 & 3.88 & $-0.47$ & 3.80 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+After first order differencing:
+
+- Both $\nab X_t$ series fluctuate around a mean close to zero with no visible trend.
+- The variance appears roughly constant over time, though NVDA shows periods of wider fluctuations (volatility clustering, visible in mid 2024 and early 2025), which is a well documented feature of financial returns [@brockwell2016].
+- The histograms are approximately bell shaped but deviate from normality in two ways. First, the excess kurtosis is 4.29 for GOOGL and 3.80 for NVDA (a Gaussian distribution has excess kurtosis equal to 0), indicating heavier tails than a normal distribution would predict. Second, GOOGL is positively skewed ($S = 0.46$), meaning the right tail is heavier, while NVDA is negatively skewed ($S = -0.47$), meaning the left tail is heavier. These are moderate departures consistent with the known leptokurtic nature of daily stock returns.
+
+Based on visual inspection, both first differenced series are plausibly weakly stationary: they have a roughly constant mean and an autocovariance structure that does not appear to shift systematically over time. We test this formally in Section 5.
+
+The combined differencing ($\nab_5 \circ \nab$) produces a residual that looks similar, which further supports that the seasonal component is negligible.
+
+\newpage
+
+# Filtering
+
+## Linear Filter
+
+The symmetric linear (moving average) filter is defined as:
+\begin{equation}
+\hat{m}_t = \frac{1}{2q+1} \sum_{j=-q}^{q} X_{t+j}.
+\end{equation}
+This is an unbiased estimator of a linear trend $m_t = a_0 + a_1 t$ because the symmetric weights satisfy $\sum_{j=-q}^{q} j = 0$. To see this, suppose $X_t = m_t + Z_t$ where $m_t = a_0 + a_1 t$ and $\E[Z_t] = 0$. Then:
+\begin{align}
+\E[\hat{m}_t] &= \frac{1}{2q+1} \sum_{j=-q}^{q} \E[X_{t+j}] = \frac{1}{2q+1} \sum_{j=-q}^{q} (a_0 + a_1(t+j)) \nonumber \\
+&= \frac{1}{2q+1} \left( (2q+1)a_0 + a_1 t(2q+1) + a_1 \sum_{j=-q}^{q} j \right) \nonumber \\
+&= a_0 + a_1 t = m_t,
+\end{align}
+since $\sum_{j=-q}^{q} j = 0$. Thus $\hat{m}_t$ is unbiased for linear trends, as stated in @brockwell2016 [Chapter 1].
+
+Larger $q$ gives stronger smoothing but loses the first and last $q$ observations. We compare $q = 10$ (window of 21 days, approximately one trading month) and $q = 31$ (window of 63 days, approximately one trading quarter) to illustrate the trade off.
+
+```{python fig-linear-filter, fig.cap="Linear (moving average) filter applied to GOOGL and NVDA for $q = 10$ and $q = 31$.", results='hide'}
+q_values = [10, 31]
+
+fig, axes = plt.subplots(len(TICKERS), 1, figsize=(14, 9), sharex=True)
+for i, ticker in enumerate(TICKERS):
+    axes[i].plot(prices.index, prices[ticker], lw=0.6, alpha=0.5, label="Raw", color="grey")
+    for q in q_values:
+        window = 2 * q + 1
+        ma = prices[ticker].rolling(window=window, center=True).mean()
+        axes[i].plot(ma.index, ma, lw=1.5, label=f"$q = {q}$ (window = {window})")
+    axes[i].set_title(f"{ticker} -- Linear (Moving Average) Filter")
+    axes[i].set_ylabel("Price (USD)")
+    axes[i].legend(fontsize=9)
+axes[-1].set_xlabel("Date")
+fig.tight_layout()
+plt.savefig("fig_linear_filter.pdf", bbox_inches="tight")
+plt.show()
+```
+
+We select $q = 10$ (21 day window, approximately one trading month) as the preferred linear filter. This choice provides a good balance: it smooths out daily noise while preserving medium term movements and losing relatively few observations (10 from each end, 20 total). The larger $q = 31$ oversmooths and drops 62 observations from the boundary.
+
+```{python linear-residuals, include=FALSE}
+q_chosen = 10
+window_chosen = 2 * q_chosen + 1
+
+linear_trend = {}
+linear_resid = {}
+
+for ticker in TICKERS:
+    linear_trend[ticker] = prices[ticker].rolling(window=window_chosen, center=True).mean()
+    linear_resid[ticker] = prices[ticker] - linear_trend[ticker]
+
+linear_resid_df = pd.DataFrame(linear_resid).dropna()
+```
+
+```{python fig-linear-resid, fig.cap="Residuals after applying the linear filter with $q = 10$.", results='hide'}
+fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+for i, ticker in enumerate(TICKERS):
+    axes[i].plot(linear_resid_df.index, linear_resid_df[ticker], lw=0.7, color=f"C{i}")
+    axes[i].axhline(0, color="k", lw=0.5)
+    axes[i].set_title(f"{ticker} -- Residual after linear filter ($q = {q_chosen}$)")
+    axes[i].set_ylabel("USD")
+axes[-1].set_xlabel("Date")
+fig.tight_layout()
+plt.savefig("fig_linear_resid.pdf", bbox_inches="tight")
+plt.show()
+```
+
+## Exponential Filter
+
+The exponential smoothing recursion is defined as:
+\begin{equation}
+\hat{m}_1 = X_1, \qquad \hat{m}_t = \alpha X_t + (1 - \alpha)\hat{m}_{t-1}, \quad t = 2, \ldots, N.
+\end{equation}
+When $\alpha$ is close to 1, the estimate closely tracks the raw series (almost no smoothing). When $\alpha$ is close to 0, the estimate reacts very slowly to new observations (heavy smoothing).
+
+By unrolling the recursion, we obtain the explicit form:
+\begin{equation}
+\hat{m}_t = \alpha \sum_{j=0}^{t-2} (1-\alpha)^j X_{t-j} + (1-\alpha)^{t-1} X_1.
+\end{equation}
+The weights $(1-\alpha)^j$ decay geometrically, so recent observations receive more weight than distant ones. This makes the filter causal (it depends only on past and present observations), but it introduces a phase lag when tracking a rising or falling trend, because $\hat{m}_t$ is always "catching up" to the current level.
+
+We compare $\alpha = 0.05$ (heavy smoothing) and $\alpha = 0.3$ (moderate smoothing).
+
+```{python exp-smooth-def, include=FALSE}
+def exponential_smooth(x, alpha):
+    n = len(x)
+    m = np.zeros(n)
+    m[0] = x[0]
+    for t in range(1, n):
+        m[t] = alpha * x[t] + (1 - alpha) * m[t - 1]
+    return m
+```
+
+```{python fig-exp-filter, fig.cap="Exponential smoothing applied to GOOGL and NVDA for $\\alpha = 0.05$ and $\\alpha = 0.3$.", results='hide'}
+alpha_values = [0.05, 0.3]
+
+fig, axes = plt.subplots(len(TICKERS), 1, figsize=(14, 9), sharex=True)
+for i, ticker in enumerate(TICKERS):
+    axes[i].plot(prices.index, prices[ticker], lw=0.6, alpha=0.5, label="Raw", color="grey")
+    for al in alpha_values:
+        smoothed = exponential_smooth(prices[ticker].values, al)
+        axes[i].plot(prices.index, smoothed, lw=1.5, label=f"$\\alpha = {al}$")
+    axes[i].set_title(f"{ticker} -- Exponential Smoothing")
+    axes[i].set_ylabel("Price (USD)")
+    axes[i].legend(fontsize=9)
+axes[-1].set_xlabel("Date")
+fig.tight_layout()
+plt.savefig("fig_exp_filter.pdf", bbox_inches="tight")
+plt.show()
+```
+
+We select $\alpha = 0.05$ as the preferred exponential smoothing parameter. This provides heavy smoothing, yielding a trend estimate that captures the long run level without reacting to short term fluctuations. However, because the exponential filter is causal ($\hat{m}_t$ depends only on $X_1, \ldots, X_t$), the trend estimate lags behind rapid price movements. This is visible in the residual plot (Figure 9), where the residuals drift persistently above or below zero rather than oscillating symmetrically. The effect is more pronounced for GOOGL, whose sharper rally in late 2025 causes the trend estimate to fall further behind.
+
+```{python exp-residuals, include=FALSE}
+alpha_chosen = 0.05
+exp_trend = {}
+exp_resid = {}
+
+for ticker in TICKERS:
+    sm = exponential_smooth(prices[ticker].values, alpha_chosen)
+    exp_trend[ticker] = pd.Series(sm, index=prices.index)
+    exp_resid[ticker] = prices[ticker] - exp_trend[ticker]
+
+exp_resid_df = pd.DataFrame(exp_resid)
+```
+
+```{python fig-exp-resid, fig.cap="Residuals after applying exponential smoothing with $\\alpha = 0.05$.", results='hide'}
+fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+for i, ticker in enumerate(TICKERS):
+    axes[i].plot(exp_resid_df.index, exp_resid_df[ticker], lw=0.7, color=f"C{i}")
+    axes[i].axhline(0, color="k", lw=0.5)
+    axes[i].set_title(f"{ticker} -- Residual after exponential filter ($\\alpha = {alpha_chosen}$)")
+    axes[i].set_ylabel("USD")
+axes[-1].set_xlabel("Date")
+fig.tight_layout()
+plt.savefig("fig_exp_resid.pdf", bbox_inches="tight")
+plt.show()
+```
+
+## Comparison of Filtering Techniques
+
+```{python fig-filter-comparison, fig.cap="Comparison of trend estimates: linear filter ($q = 10$, solid) versus exponential filter ($\\alpha = 0.05$, dashed).", results='hide'}
+fig, axes = plt.subplots(len(TICKERS), 1, figsize=(14, 9), sharex=True)
+for i, ticker in enumerate(TICKERS):
+    axes[i].plot(prices.index, prices[ticker], lw=0.5, alpha=0.4, label="Raw", color="grey")
+    axes[i].plot(linear_trend[ticker].index, linear_trend[ticker],
+                 lw=1.8, label=f"Linear ($q={q_chosen}$)", color="C0")
+    axes[i].plot(exp_trend[ticker].index, exp_trend[ticker],
+                 lw=1.8, ls="--", label=f"Exponential ($\\alpha={alpha_chosen}$)", color="C1")
+    axes[i].set_title(f"{ticker} -- Trend Estimates Comparison")
+    axes[i].set_ylabel("Price (USD)")
+    axes[i].legend(fontsize=9)
+axes[-1].set_xlabel("Date")
+fig.tight_layout()
+plt.savefig("fig_filter_comparison.pdf", bbox_inches="tight")
+plt.show()
+```
+
+Table 4 compares the two filters.
+
+\begin{table}[H]
+\centering
+\caption{Comparison of linear and exponential filters.}
+\begin{tabular}{lcc}
+\toprule
+Criterion & Linear ($q=10$) & Exponential ($\alpha=0.05$) \\
+\midrule
+Symmetry & Symmetric (centred) & One sided (causal) \\
+Boundary loss & 10 obs. from each end & None \\
+Residual std (GOOGL) & 4.65 & 11.95 \\
+Residual std (NVDA) & 4.97 & 9.50 \\
+Real time use & Requires future values & Causal (online) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The residual standard deviations of the exponential filter are two to three times larger than those of the linear filter. This is visible in the residual plots: the exponential filter residuals exhibit a persistent drift (the trend estimate lags behind the actual price), whereas the linear filter residuals oscillate symmetrically around zero.
+
+The reason is structural. The exponential smoothing estimator $\hat{m}_t = \alpha X_t + (1-\alpha)\hat{m}_{t-1}$ is causal, so it inevitably lags behind a rising or falling trend. The symmetric moving average $\hat{m}_t = \frac{1}{2q+1}\sum_{j=-q}^{q} X_{t+j}$ uses both past and future observations, producing an unbiased trend estimate for linear trends (as shown by the proof in Section 4.1, using $\sum_{j=-q}^{q} j = 0$).
+
+**Recommendation.** For this retrospective analysis where the full dataset is available, we prefer the linear (moving average) filter with $q = 10$. Its symmetric nature yields residuals that are centred around zero, making the extracted noise more suitable for stationarity analysis. The exponential filter would be more appropriate in a real time forecasting setting where future observations are unavailable.
+
+\newpage
+
+# Stationarity
+
+## Construction of Stationary Series
+
+Based on the analysis above, we use first order differencing ($\nab X_t = X_t - X_{t-1}$) as our preferred decomposition approach for both series. This choice is justified because:
+
+1. The raw series exhibit a clear trend but no deterministic seasonality.
+2. First differencing effectively removes the linear trend. By the polynomial trend annihilation result [@brockwell2016, Theorem 1.4.1], $\nab$ annihilates any polynomial of degree at most 1.
+3. It preserves the maximum number of observations ($N - 1 = 521$).
+
+The resulting series $Y_t = \nab X_t$ will be tested for weak stationarity. A time series $\{Y_t\}$ is weakly stationary if:
+\begin{enumerate}
+\item $\E[Y_t] = \mu$ for all $t$ (constant mean), and
+\item $\Cov(Y_t, Y_{t+h}) = \gamma(h)$ for all $t$ (autocovariance depends only on the lag $h$, not on $t$).
+\end{enumerate}
+
+```{python stationary-series, include=FALSE}
+stationary = diff1.copy()
+n_stat = len(stationary)
+```
+
+```{python fig-stationary, fig.cap="Preferred stationary series $Y_t = \\nabla X_t$ for GOOGL and NVDA.", results='hide'}
+fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+for i, ticker in enumerate(TICKERS):
+    axes[i].plot(stationary.index, stationary[ticker], lw=0.7, color=f"C{i}")
+    axes[i].axhline(0, color="k", lw=0.5)
+    axes[i].set_title(f"{ticker} -- Stationary series $Y_t = \\nabla X_t$ ($n = {n_stat}$)")
+    axes[i].set_ylabel("USD")
+axes[-1].set_xlabel("Date")
+fig.tight_layout()
+plt.savefig("fig_stationary.pdf", bbox_inches="tight")
+plt.show()
+```
+
+We assess weak stationarity using three hypothesis tests: the Ljung--Box test, the Turning Point test, and the Difference Sign test. All three test the null hypothesis that the observations are independent and identically distributed (i.i.d.), which is a sufficient (but not necessary) condition for weak stationarity.
+
+**Ljung--Box test.** The test statistic is:
+\begin{equation}
+Q_{LB}(h) = n(n+2) \sum_{j=1}^{h} \frac{\hat{\rho}(j)^2}{n - j},
+\end{equation}
+where $\hat{\rho}(j)$ is the sample autocorrelation at lag $j$. Under $H_0$ (i.i.d. noise), $Q_{LB}(h) \sim \chi^2(h)$ asymptotically. We use $h = \lfloor \sqrt{n} \rfloor = 22$.
+
+**Turning Point test.** A turning point at index $i$ occurs when $Y_i$ is a local extremum (either $Y_{i-1} < Y_i > Y_{i+1}$ or $Y_{i-1} > Y_i < Y_{i+1}$). Let $T$ be the total count. Under $H_0$:
+\begin{equation}
+\E[T] = \frac{2(n-2)}{3}, \qquad \Var(T) = \frac{16n - 29}{90}.
+\end{equation}
+The standardized statistic $Z_T = (T - \E[T])/\sqrt{\Var(T)}$ is approximately $\mathcal{N}(0,1)$.
+
+**Difference Sign test.** Let $S = \#\{t : Y_t > Y_{t-1}\}$ be the number of positive increments. Under $H_0$:
+\begin{equation}
+\E[S] = \frac{n-1}{2}, \qquad \Var(S) = \frac{n+1}{12}.
+\end{equation}
+The standardized statistic $Z_S = (S - \E[S])/\sqrt{\Var(S)}$ is approximately $\mathcal{N}(0,1)$.
+
+```{python hypothesis-tests, include=FALSE}
+def ljung_box(x, h):
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    x_centered = x - x.mean()
+    gamma0 = np.sum(x_centered ** 2) / n
+    Q = 0.0
+    for j in range(1, h + 1):
+        gamma_j = np.sum(x_centered[j:] * x_centered[:-j]) / n
+        rho_j = gamma_j / gamma0
+        Q += rho_j ** 2 / (n - j)
+    Q *= n * (n + 2)
+    p_value = 1 - stats.chi2.cdf(Q, df=h)
+    return Q, p_value
+
+def turning_point_test(x):
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    T = 0
+    for i in range(1, n - 1):
+        if (x[i] > x[i-1] and x[i] > x[i+1]) or \
+           (x[i] < x[i-1] and x[i] < x[i+1]):
+            T += 1
+    mu_T = 2 * (n - 2) / 3
+    var_T = (16 * n - 29) / 90
+    z = (T - mu_T) / np.sqrt(var_T)
+    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+    return T, z, p_value
+
+def difference_sign_test(x):
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    S = np.sum(x[1:] > x[:-1])
+    mu_S = (n - 1) / 2
+    var_S = (n + 1) / 12
+    z = (S - mu_S) / np.sqrt(var_S)
+    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+    return S, z, p_value
+
+h_lb = int(np.sqrt(n_stat))
+test_results = {}
+for ticker in TICKERS:
+    y = stationary[ticker].values
+    Q, p_lb = ljung_box(y, h_lb)
+    T, z_tp, p_tp = turning_point_test(y)
+    S, z_ds, p_ds = difference_sign_test(y)
+    test_results[ticker] = {
+        "lb_Q": Q, "lb_p": p_lb,
+        "tp_T": T, "tp_z": z_tp, "tp_p": p_tp,
+        "ds_S": S, "ds_z": z_ds, "ds_p": p_ds
+    }
+```
+
+Table 5 reports the results of the three hypothesis tests.
+
+\begin{table}[H]
+\centering
+\caption{Hypothesis tests for weak stationarity of $Y_t = \nab X_t$.}
+\begin{tabular}{llrrl}
+\toprule
+Ticker & Test & Statistic & $p$-value & Reject $H_0$ at 5\%? \\
+\midrule
+GOOGL & Ljung--Box & 23.42 & 0.383 & No \\
+      & Turning Point & $-0.42$ & 0.677 & No \\
+      & Difference Sign & $-0.91$ & 0.363 & No \\
+\midrule
+NVDA  & Ljung--Box & 35.01 & 0.039 & Yes \\
+      & Turning Point & $-0.52$ & 0.603 & No \\
+      & Difference Sign & $-0.15$ & 0.880 & No \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+**GOOGL.** All three tests fail to reject $H_0$ at the 5\% level ($p = 0.383, 0.677, 0.363$). There is no evidence against the hypothesis that the first differenced GOOGL series is i.i.d. noise. This is consistent with weak stationarity.
+
+**NVDA.** The Ljung--Box test rejects $H_0$ at the 5\% level ($Q_{LB} = 35.01$, $p = 0.039$), indicating that the autocorrelations at lags $1, \ldots, 22$ are not jointly zero. However, the Turning Point test ($p = 0.603$) and Difference Sign test ($p = 0.880$) both fail to reject.
+
+This pattern is informative: the Ljung--Box test detects mild linear autocorrelation (the ACF at a few individual lags slightly exceeds the 95\% band; see Section 5.2), but the Turning Point and Difference Sign tests, which are sensitive to departures from independence in the ordering of observations, find no evidence of nonrandomness in the sign or turning point structure.
+
+It is important to note that weak stationarity does not require the series to be i.i.d. noise. Weak stationarity requires (i) $\E[Y_t] = \mu$ for all $t$ and (ii) $\Cov(Y_t, Y_{t+h}) = \gamma(h)$ for all $t$. A weakly stationary series can have nonzero autocorrelation; it simply must be time invariant. The Ljung--Box rejection tells us that NVDA's first differenced series is not pure white noise, but it does not imply nonstationarity. Both series are consistent with weak stationarity.
+
+## Autocorrelation Function
+
+We write a custom function to estimate the autocorrelation function (ACF) at lag $h$. The sample autocovariance at lag $h$ is:
+\begin{equation}
+\hat{\gamma}(h) = \frac{1}{n} \sum_{t=1}^{n-h} (X_t - \bar{X})(X_{t+h} - \bar{X}),
+\end{equation}
+and the sample autocorrelation is:
+\begin{equation}
+\hat{\rho}(h) = \frac{\hat{\gamma}(h)}{\hat{\gamma}(0)}.
+\end{equation}
+
+Note that $\hat{\rho}(0) = 1$ by definition. Under the null hypothesis that $\{X_t\}$ is i.i.d. noise, Bartlett's formula gives the asymptotic distribution $\hat{\rho}(h) \sim \mathcal{N}(0, 1/n)$ for $h \geq 1$. The 95\% confidence bands are therefore:
+\begin{equation}
+\pm \frac{z_{0.025}}{\sqrt{n}} = \pm \frac{1.96}{\sqrt{n}}.
+\end{equation}
+
+For $n = 521$, the confidence bounds are $\pm 1.96 / \sqrt{521} \approx \pm 0.086$.
+
+```{python acf-function, include=FALSE}
+def estimate_acf(x, max_lag):
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    x_centered = x - x.mean()
+    gamma_0 = np.sum(x_centered ** 2) / n
+    acf_vals = np.zeros(max_lag + 1)
+    acf_vals[0] = 1.0
+    for h in range(1, max_lag + 1):
+        gamma_h = np.sum(x_centered[h:] * x_centered[:-h]) / n
+        acf_vals[h] = gamma_h / gamma_0
+    return np.arange(max_lag + 1), acf_vals
+```
+
+```{python fig-acf, fig.cap="Sample ACF of the first differenced series $\\nabla X_t$ for GOOGL (left) and NVDA (right).", results='hide'}
+max_lag = 40
+ci_bound = 1.96 / np.sqrt(n_stat)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for i, ticker in enumerate(TICKERS):
+    lags, acf_vals = estimate_acf(stationary[ticker].values, max_lag)
+    axes[i].bar(lags, acf_vals, width=0.6, color=f"C{i}", alpha=0.7)
+    axes[i].axhline(ci_bound, color="red", ls="--", lw=1, label=f"95% CI ($\\pm${ci_bound:.3f})")
+    axes[i].axhline(-ci_bound, color="red", ls="--", lw=1)
+    axes[i].axhline(0, color="k", lw=0.5)
+    axes[i].set_title(f"{ticker} -- Sample ACF of $\\nabla X_t$")
+    axes[i].set_xlabel("Lag $h$")
+    axes[i].set_ylabel("$\\hat{{\\rho}}(h)$")
+    axes[i].legend(fontsize=9)
+fig.tight_layout()
+plt.savefig("fig_acf.pdf", bbox_inches="tight")
+plt.show()
+```
+
+The ACF estimates are interpreted as follows.
+
+- $\hat{\rho}(0) = 1$ by definition.
+- **GOOGL.** All ACF values at lags $h \geq 1$ lie within the 95\% confidence bands $\pm 0.086$. There is no evidence of autocorrelation at any individual lag, consistent with the non rejection of the Ljung--Box test ($p = 0.383$). The first differenced GOOGL series behaves like white noise.
+- **NVDA.** Several ACF bars exceed the confidence bands (notably near lags approximately 3, 20, 25, 31, and 35). These exceedances do not follow a pattern of slow decay (which would indicate a remaining trend) or regular oscillation (which would indicate seasonality). Instead, they appear scattered, suggesting mild, isolated autocorrelation at specific lags. This is consistent with the marginal Ljung--Box rejection ($p = 0.039$): the joint test accumulates these small individual exceedances.
+- Under the null hypothesis of i.i.d. noise, we expect roughly $0.05 \times 40 = 2$ false exceedances out of 40 lags. NVDA shows slightly more than this, which aligns with the weak but statistically detectable autocorrelation structure. Importantly, the ACF does not exhibit slow decay, confirming that the trend has been successfully removed.
+
+## Partial Autocorrelation Function
+
+The partial autocorrelation at lag $h$, denoted $\phi_{hh}$, is the correlation between $X_t$ and $X_{t+h}$ after removing the linear effect of the intermediate observations $X_{t+1}, \ldots, X_{t+h-1}$.
+
+We estimate it by solving the Yule--Walker equations recursively using the Durbin--Levinson algorithm [@brockwell2016, Section 2.5]:
+\begin{align}
+\phi_{11} &= \hat{\rho}(1), \\
+\phi_{hh} &= \frac{\hat{\rho}(h) - \sum_{j=1}^{h-1} \phi_{h-1,j}\, \hat{\rho}(h-j)}{1 - \sum_{j=1}^{h-1} \phi_{h-1,j}\, \hat{\rho}(j)}, \qquad h = 2, 3, \ldots,
+\end{align}
+with the update:
+\begin{equation}
+\phi_{h,j} = \phi_{h-1,j} - \phi_{hh}\, \phi_{h-1,h-j}, \qquad j = 1, \ldots, h-1.
+\end{equation}
+
+Under $H_0$ (i.i.d. noise), the asymptotic distribution is the same as for the ACF: $\hat{\phi}_{hh} \sim \mathcal{N}(0, 1/n)$.
+
+```{python pacf-function, include=FALSE}
+def estimate_pacf(x, max_lag):
+    _, rho = estimate_acf(x, max_lag)
+    pacf_vals = np.zeros(max_lag + 1)
+    pacf_vals[0] = 1.0
+    phi = np.zeros((max_lag + 1, max_lag + 1))
+    phi[1, 1] = rho[1]
+    pacf_vals[1] = rho[1]
+    for h in range(2, max_lag + 1):
+        num = rho[h] - np.sum(phi[h-1, 1:h] * rho[1:h][::-1])
+        den = 1.0 - np.sum(phi[h-1, 1:h] * rho[1:h])
+        phi[h, h] = num / den
+        for j in range(1, h):
+            phi[h, j] = phi[h-1, j] - phi[h, h] * phi[h-1, h-j]
+        pacf_vals[h] = phi[h, h]
+    return np.arange(1, max_lag + 1), pacf_vals[1:]
+```
+
+```{python fig-pacf, fig.cap="Sample PACF of the first differenced series $\\nabla X_t$ for GOOGL (left) and NVDA (right).", results='hide'}
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for i, ticker in enumerate(TICKERS):
+    lags, pacf_vals = estimate_pacf(stationary[ticker].values, max_lag)
+    axes[i].bar(lags, pacf_vals, width=0.6, color=f"C{i}", alpha=0.7)
+    axes[i].axhline(ci_bound, color="red", ls="--", lw=1, label=f"95% CI ($\\pm${ci_bound:.3f})")
+    axes[i].axhline(-ci_bound, color="red", ls="--", lw=1)
+    axes[i].axhline(0, color="k", lw=0.5)
+    axes[i].set_title(f"{ticker} -- Sample PACF of $\\nabla X_t$")
+    axes[i].set_xlabel("Lag $h$")
+    axes[i].set_ylabel("$\\hat{{\\phi}}_{{hh}}$")
+    axes[i].legend(fontsize=9)
+fig.tight_layout()
+plt.savefig("fig_pacf.pdf", bbox_inches="tight")
+plt.show()
+```
+
+The PACF estimates are interpreted as follows.
+
+- The PACF at lag $h$, $\hat{\phi}_{hh}$, measures the direct linear dependence between $Y_t$ and $Y_{t+h}$ after removing the linear effect of $Y_{t+1}, \ldots, Y_{t+h-1}$. Under $H_0$ (i.i.d. noise), $\hat{\phi}_{hh} \sim \mathcal{N}(0, 1/n)$, so the 95\% bands are again $\pm 0.086$.
+- **GOOGL.** All PACF bars remain within the confidence bands. No lag shows significant partial autocorrelation. This is consistent with the ACF result and confirms that $\nab X_t$ for GOOGL is well described as white noise.
+- **NVDA.** Several PACF values reach or slightly exceed the confidence bands (notably at lags approximately 3, 4, 8, 17, 20, and 25). There is no sharp cutoff after a single lag $p$, which would indicate a pure AR($p$) process. Instead, the mild exceedances are scattered across multiple lags, consistent with the weak autocorrelation detected by the Ljung--Box test. This suggests that while the differenced NVDA series is weakly stationary, it may not be pure white noise. A low order ARMA model could potentially capture the residual dependence (to be explored in Part 2).
+- Together, the ACF and PACF confirm that first order differencing has successfully removed the trend. The residual dependence structure, where present, is mild.
+
+\newpage
+
+# Summary of Results
+
+Table 6 provides an overview of the key findings from each section.
+
+\begin{table}[H]
+\centering
+\caption{Summary of key findings.}
+\begin{tabular}{lp{10cm}}
+\toprule
+Section & Key Finding \\
+\midrule
+Q1 & GOOGL and NVDA daily close prices (Jan 2024 to Jan 2026, $N = 522$) exhibit clear upward trends. No obvious deterministic seasonality is present. \\
+Q2 & First order differencing ($\nab$) removes the trend effectively (residual means $\approx 0.3$ to $0.4$ vs. standard deviations $\approx 3.6$ to $3.9$). No seasonal differencing is needed ($\nab_5$, $\nab_{63}$ show no improvement). The differenced series are leptokurtic (excess kurtosis $\approx 3.8$ to $4.3$) with moderate skewness. \\
+Q3 & Linear filter ($q=10$, residual std $\approx 4.6$ to $5.0$) substantially outperforms exponential filter ($\alpha=0.05$, residual std $\approx 9.5$ to $12.0$) because the latter's causal nature causes phase lag. The linear filter is recommended for retrospective analysis. \\
+Q4 & GOOGL: all three tests fail to reject i.i.d. noise; ACF and PACF within 95\% bands. NVDA: Ljung--Box marginally rejects ($p = 0.039$) but Turning Point and Difference Sign do not; mild scattered autocorrelation is visible in ACF/PACF, but no evidence against weak stationarity. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\newpage
+
+# References
+
+<div id="refs"></div>
+
+\newpage
+
+# Code Appendix
+
+All code used in this report is written in Python 3 and executed via the `reticulate` package in R Markdown. The random number generator is initialized with `np.random.seed(3379)` to ensure full reproducibility.
+
+## Data Loading and Preprocessing
+
+```{python ref.label='py-setup', echo=TRUE, eval=FALSE}
+```
+
+```{python ref.label='load-data', echo=TRUE, eval=FALSE}
+```
+
+## Question 1: Descriptive Statistics and Plots
+
+```{python ref.label='desc-stats', echo=TRUE, eval=FALSE}
+```
+
+```{python echo=TRUE, eval=FALSE}
+fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
+for i, ticker in enumerate(TICKERS):
+    axes[i].plot(prices.index, prices[ticker], linewidth=1.2, color=f"C{i}")
+    axes[i].set_ylabel("Close Price (USD)")
+    axes[i].set_title(f"{ticker}")
+axes[-1].set_xlabel("Date")
+fig.tight_layout()
+plt.show()
+```
+
+```{python echo=TRUE, eval=FALSE}
+norm = prices / prices.iloc[0] * 100
+fig, ax = plt.subplots(figsize=(13, 5))
+for ticker in TICKERS:
+    ax.plot(norm.index, norm[ticker], linewidth=1.3, label=ticker)
+ax.axhline(100, color="grey", ls="--", lw=0.8)
+ax.set_title("Normalized Performance (Base = 100 at Start)")
+ax.set_ylabel("Normalized Price")
+ax.set_xlabel("Date")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## Question 2: Differencing
+
+```{python echo=TRUE, eval=FALSE}
+diff1 = prices.diff(1).dropna()
+diff2 = prices.diff(1).diff(1).dropna()
+
+diff_d5  = prices.diff(5).dropna()
+diff_d63 = prices.diff(63).dropna()
+
+diff_combined = prices.diff(5).diff(1).dropna()
+```
+
+```{python echo=TRUE, eval=FALSE}
+fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex="col")
+for i, ticker in enumerate(TICKERS):
+    axes[i, 0].plot(diff1.index, diff1[ticker], linewidth=0.7, color=f"C{i}")
+    axes[i, 0].axhline(0, color="k", lw=0.5)
+    axes[i, 0].set_title(f"{ticker} -- first difference")
+    axes[i, 0].set_ylabel("USD")
+    axes[i, 1].plot(diff2.index, diff2[ticker], linewidth=0.7, color=f"C{i}")
+    axes[i, 1].axhline(0, color="k", lw=0.5)
+    axes[i, 1].set_title(f"{ticker} -- second difference")
+    axes[i, 1].set_ylabel("USD")
+for ax in axes[-1, :]:
+    ax.set_xlabel("Date")
+fig.tight_layout()
+plt.show()
+```
+
+## Question 3: Filtering
+
+```{python echo=TRUE, eval=FALSE}
+q_chosen = 10
+window_chosen = 2 * q_chosen + 1
+linear_trend = {}
+linear_resid = {}
+for ticker in TICKERS:
+    linear_trend[ticker] = prices[ticker].rolling(
+        window=window_chosen, center=True
+    ).mean()
+    linear_resid[ticker] = prices[ticker] - linear_trend[ticker]
+linear_resid_df = pd.DataFrame(linear_resid).dropna()
+```
+
+```{python ref.label='exp-smooth-def', echo=TRUE, eval=FALSE}
+```
+
+```{python echo=TRUE, eval=FALSE}
+alpha_chosen = 0.05
+exp_trend = {}
+exp_resid = {}
+for ticker in TICKERS:
+    sm = exponential_smooth(prices[ticker].values, alpha_chosen)
+    exp_trend[ticker] = pd.Series(sm, index=prices.index)
+    exp_resid[ticker] = prices[ticker] - exp_trend[ticker]
+exp_resid_df = pd.DataFrame(exp_resid)
+```
+
+## Question 4: Stationarity Tests, ACF, and PACF
+
+```{python ref.label='hypothesis-tests', echo=TRUE, eval=FALSE}
+```
+
+```{python ref.label='acf-function', echo=TRUE, eval=FALSE}
+```
+
+```{python ref.label='pacf-function', echo=TRUE, eval=FALSE}
+```
+
+```{python echo=TRUE, eval=FALSE}
+max_lag = 40
+ci_bound = 1.96 / np.sqrt(n_stat)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for i, ticker in enumerate(TICKERS):
+    lags, acf_vals = estimate_acf(stationary[ticker].values, max_lag)
+    axes[i].bar(lags, acf_vals, width=0.6, color=f"C{i}", alpha=0.7)
+    axes[i].axhline(ci_bound, color="red", ls="--", lw=1,
+                    label=f"95% CI")
+    axes[i].axhline(-ci_bound, color="red", ls="--", lw=1)
+    axes[i].axhline(0, color="k", lw=0.5)
+    axes[i].set_title(f"{ticker} -- Sample ACF")
+    axes[i].set_xlabel("Lag h")
+    axes[i].set_ylabel("rho(h)")
+    axes[i].legend(fontsize=9)
+fig.tight_layout()
+plt.show()
+```
+
+```{python echo=TRUE, eval=FALSE}
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for i, ticker in enumerate(TICKERS):
+    lags, pacf_vals = estimate_pacf(stationary[ticker].values, max_lag)
+    axes[i].bar(lags, pacf_vals, width=0.6, color=f"C{i}", alpha=0.7)
+    axes[i].axhline(ci_bound, color="red", ls="--", lw=1,
+                    label=f"95% CI")
+    axes[i].axhline(-ci_bound, color="red", ls="--", lw=1)
+    axes[i].axhline(0, color="k", lw=0.5)
+    axes[i].set_title(f"{ticker} -- Sample PACF")
+    axes[i].set_xlabel("Lag h")
+    axes[i].set_ylabel("phi_hh")
+    axes[i].legend(fontsize=9)
+fig.tight_layout()
+plt.show()
+```
+
+\newpage
+
+# AI Use Disclosure
+
+No artificial intelligence tools were used in the preparation of this report. All code was written by the team members. All mathematical derivations, interpretations, and written analysis were produced by the team without AI assistance.
